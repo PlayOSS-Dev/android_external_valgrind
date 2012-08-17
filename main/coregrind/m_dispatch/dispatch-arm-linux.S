@@ -85,10 +85,10 @@ VG_(run_innerloop__dispatch_unprofiled):
         modified guest state ptr */
 
         /* Has the guest state pointer been messed with?  If yes, exit. */
-        movw r3, #:lower16:VG_(dispatch_ctr)
+        //movw r3, #:lower16:VG_(dispatch_ctr)
         tst  r8, #1
 
-        movt r3, #:upper16:VG_(dispatch_ctr)
+        //movt r3, #:upper16:VG_(dispatch_ctr)
 
 	bne  gsp_changed
 
@@ -106,11 +106,11 @@ VG_(run_innerloop__dispatch_unprofiled):
 
         /* try a fast lookup in the translation cache */
         // r0 = next guest, r1,r2,r3,r4 scratch
-        movw r1, #VG_TT_FAST_MASK       // r1 = VG_TT_FAST_MASK
-        movw r4, #:lower16:VG_(tt_fast)
+        //movw r1, #VG_TT_FAST_MASK       // r1 = VG_TT_FAST_MASK
+        //movw r4, #:lower16:VG_(tt_fast)
 
 	and  r2, r1, r0, LSR #1         // r2 = entry #
-        movt r4, #:upper16:VG_(tt_fast) // r4 = &VG_(tt_fast)
+        //movt r4, #:upper16:VG_(tt_fast) // r4 = &VG_(tt_fast)
 
 	add  r1, r4, r2, LSL #3         // r1 = &tt_fast[entry#]
 
@@ -141,10 +141,10 @@ VG_(run_innerloop__dispatch_profiled):
         modified guest state ptr */
 
         /* Has the guest state pointer been messed with?  If yes, exit. */
-        movw r3, #:lower16:VG_(dispatch_ctr)
+        //movw r3, #:lower16:VG_(dispatch_ctr)
 	tst  r8, #1
 
-        movt r3, #:upper16:VG_(dispatch_ctr)
+        //movt r3, #:upper16:VG_(dispatch_ctr)
 
 	bne  gsp_changed
 
@@ -162,11 +162,11 @@ VG_(run_innerloop__dispatch_profiled):
 
         /* try a fast lookup in the translation cache */
         // r0 = next guest, r1,r2,r3,r4 scratch
-        movw r1, #VG_TT_FAST_MASK       // r1 = VG_TT_FAST_MASK
-        movw r4, #:lower16:VG_(tt_fast)
+        //movw r1, #VG_TT_FAST_MASK       // r1 = VG_TT_FAST_MASK
+        //movw r4, #:lower16:VG_(tt_fast)
 
 	and  r2, r1, r0, LSR #1         // r2 = entry #
-        movt r4, #:upper16:VG_(tt_fast) // r4 = &VG_(tt_fast)
+        //movt r4, #:upper16:VG_(tt_fast) // r4 = &VG_(tt_fast)
 
 	add  r1, r4, r2, LSL #3         // r1 = &tt_fast[entry#]
 
@@ -181,8 +181,8 @@ VG_(run_innerloop__dispatch_profiled):
         // LIVE: r5, r8; all others dead
         
         /* increment bb profile counter */
-        movw r0, #:lower16:VG_(tt_fastN)
-        movt r0, #:upper16:VG_(tt_fastN) // r0 = &tt_fastN[0]
+        //movw r0, #:lower16:VG_(tt_fastN)
+        //movt r0, #:upper16:VG_(tt_fastN) // r0 = &tt_fastN[0]
         ldr  r0, [r0, r2, LSL #2]        // r0 = tt_fast[entry #]
         ldr  r3, [r0]                    // *r0 ++
         add  r3, r3, #1
