@@ -9,7 +9,9 @@
 
   Copyright (C) 2008-2011 Evan Geller
      gaze@bea.ms
-
+  Copyright (C) 2011 John Reiser
+     jreiser@BitWagon.com
+     Sept+Oct 2011:  Inner loops recoded.  Set kernel tls pointer from user's.
   This program is free software; you can redistribute it and/or
   modify it under the terms of the GNU General Public License as
   published by the Free Software Foundation; either version 2 of the
@@ -36,6 +38,21 @@
 #include "pub_core_transtab_asm.h"
 #include "libvex_guest_offsets.h"	/* for OFFSET_arm_R* */
 
+.text
+// Kernel puts a user-executable subroutine at 0xffff0fe0 to return the value
+// of the Thread Local Storage (tls) pointer.
+__aeabi_read_tp: .globl __aeabi_read_tp  // Code copied from glibc-2.13.
+	mvn r0,#0xf000  // 0xffff0fff
+	sub pc,r0,#31  // goto 0xffff0fe0: __kuser_get_tls
+
+// System call to change the tls pointer that is returned by (*0xffff0fe0)().
+real_sys_set_tls: .globl real_sys_set_tls
+	mov ip,r7
+	mov r7,#0xf0000
+	orr r7,r7,#5  // 983045
+	svc 0
+	mov r7,ip
+	bx lr
 
 /*------------------------------------------------------------*/
 /*---                                                      ---*/
@@ -55,28 +72,42 @@ UWord VG_(run_innerloop) ( void* guest_state, UWord do_profiling );
 .globl VG_(run_innerloop)
 VG_(run_innerloop):
 	push {r0, r1, r4, r5, r6, r7, r8, r9, fp, lr}
+         /* r0 (hence also [sp,#0]) holds guest_state */
+         /* r1 holds do_profiling */
+	mov r8, r0
+	mov r9, r1
+ 
+#if (ARM_ARCH_V6 | ARM_ARCH_V7)  /*{*/
 
         /* set FPSCR to vex-required default value */
         mov  r4, #0
         fmxr fpscr, r4
+#endif  /*}*/
+#if ARM_ARCH_V5TE  /*{*/
+	// Propagate user tls pointer to kernel.
+	ldr r4, [r8, #OFFSET_arm_TPIDRURO]  // our assumed tls pointer
+	bl __aeabi_read_tp                  // kernel's cached pointer
+	cmp r0, r4; beq 0f
+	mov r0, r4; bl real_sys_set_tls    // update kernel's cache
+0:
+#endif  /*}*/
 
-        /* r0 (hence also [sp,#0]) holds guest_state */
-        /* r1 holds do_profiling */
-	mov r8, r0
 	ldr r0, [r8, #OFFSET_arm_R15T]
         
        	/* fall into main loop (the right one) */
-	cmp r1, #0      /* do_profiling */
-	beq VG_(run_innerloop__dispatch_unprofiled)
-	b   VG_(run_innerloop__dispatch_profiled)
+	cmp r9, #0      /* do_profiling */
+	bne VG_(run_innerloop__dispatch_profiled)
+	// FALLTHRUOGH  b VG_(run_innerloop__dispatch_unprofiled)
 
 
 /*----------------------------------------------------*/
 /*--- NO-PROFILING (standard) dispatcher           ---*/
 /*----------------------------------------------------*/
 
-/* Pairing of insns below is my guesstimate of how dual dispatch would
-   work on an A8.  JRS, 2011-May-28 */
+// Pairing of insns below is how dual dispatch should work.
+  
+CLR_HI= 32 - VG_TT_FAST_BITS
+CLR_LO= 32 - VG_TT_FAST_BITS
  
 .global	VG_(run_innerloop__dispatch_unprofiled)
 VG_(run_innerloop__dispatch_unprofiled):
@@ -84,51 +115,78 @@ VG_(run_innerloop__dispatch_unprofiled):
 	/* AT ENTRY: r0 is next guest addr, r8 is possibly
         modified guest state ptr */
 
-        /* Has the guest state pointer been messed with?  If yes, exit. */
-        //movw r3, #:lower16:VG_(dispatch_ctr)
+#if defined(ARM_ARCH_V6)
+		/* use slower code on pre-cortex architectures */
+        ldr r3, =VG_(dispatch_ctr)
         tst  r8, #1
+#else
 
-        //movt r3, #:upper16:VG_(dispatch_ctr)
+        tst  r8, #1
+        ldr  r2,=VG_(dispatch_ctr)
+#endif
+        bne  gsp_changed                // guest state pointer was modified
+	movs r3, r0, LSR #1             // shift off Thumb mode bit; set Carry
 
-	bne  gsp_changed
+	ldr  r5,=VG_(tt_fast)
+	movcc  r3, r3, LSR #1           // if ARM mode then shift off another bit
 
-	/* save the jump address in the guest state */
-        str  r0, [r8, #OFFSET_arm_R15T]
+	ldr  r1, [r2]                   // dispatch_ctr
+	mov  r3, r3, LSL #CLR_HI        // shift off hi bits
 
-        /* Are we out of timeslice?  If yes, defer to scheduler. */
-        ldr  r2, [r3]
+        str  r0, [r8, #OFFSET_arm_R15T]  // save jump address into guest state
+	add  r5, r5, r3, LSR #CLR_LO -3 // r5= &tt_fast[entry#]
 
-        subs r2, r2, #1
+        ldr  r4, [r5, #0]               // r4= .guest
+        subs r1, r1, #1                 // decrement timeslice
 
-        str  r2, [r3]
+        ldr  r5, [r5, #4]               // r5= .host
+        beq  counter_is_zero            // out of timeslice ==> defer to scheduler
 
-        beq  counter_is_zero
+        adr  lr, VG_(run_innerloop__dispatch_unprofiled)  // &continuation
+	cmp  r4, r0                     // check cache tag
 
-        /* try a fast lookup in the translation cache */
-        // r0 = next guest, r1,r2,r3,r4 scratch
-        //movw r1, #VG_TT_FAST_MASK       // r1 = VG_TT_FAST_MASK
-        //movw r4, #:lower16:VG_(tt_fast)
+#if defined(ARM_ARCH_V6)
+		/* use slower code on pre-cortex architectures */
+        ldr r1, =VG_TT_FAST_MASK       // r1 = VG_TT_FAST_MASK
+        ldr r4, =VG_(tt_fast)
+        and  r2, r1, r0, LSR #1        // r2 = entry #
+#else
+        streq  r1, [r2]                 // match: update dispatch_ctr
+	bxeq r5                         // match: jump to .host, continue at *lr
+#endif
 
-	and  r2, r1, r0, LSR #1         // r2 = entry #
-        //movt r4, #:upper16:VG_(tt_fast) // r4 = &VG_(tt_fast)
-
-	add  r1, r4, r2, LSL #3         // r1 = &tt_fast[entry#]
-
-        ldrd r4, r5, [r1, #0]           // r4 = .guest, r5 = .host
-
-	cmp  r4, r0
-
-	bne  fast_lookup_failed
         // r5: next-host    r8: live, gsp
         // r4: next-guest
-        // r2: entry #
+        // r2: &VG_(dispatch_ctr)
+	// r1:  VG_(dispatch_ctr)
         // LIVE: r5, r8; all others dead
-        
-        /* Found a match.  Jump to .host. */
-	blx  r5
-	b    VG_(run_innerloop__dispatch_unprofiled)
-.ltorg
+fast_lookup_failed:
+	movne  r0, #VG_TRC_INNER_FASTMISS
+counter_is_zero:
+        moveq  r0, #VG_TRC_INNER_COUNTERZERO
+
+/* All exits from the dispatcher go through here.  %r0 holds
+   the return value. 
+*/
+run_innerloop_exit:
+#if (ARM_ARCH_V6 | ARM_ARCH_V7)  /*{*/
+        /* We're leaving.  Check that nobody messed with
+           FPSCR in ways we don't expect. */
+        fmrx r4, fpscr
+        bic  r4, #0xF8000000 /* mask out NZCV and QC */
+        bic  r4, #0x0000009F /* mask out IDC,IXC,UFC,OFC,DZC,IOC */
+        cmp  r4, #0
+	cmp  r4, r4  // nofp
+invariant_violation:
+        movne  r0, #VG_TRC_INVARIANT_FAILED
+#endif  /*}*/
+
+run_innerloop_exit_REALLY:
+	add sp, sp, #8
+	pop {r4, r5, r6, r7, r8, r9, fp, pc}             
 	/*NOTREACHED*/
+
+.ltorg
 
 /*----------------------------------------------------*/
 /*--- PROFILING dispatcher (can be much slower)    ---*/
@@ -136,61 +194,63 @@ VG_(run_innerloop__dispatch_unprofiled):
 
 .global	VG_(run_innerloop__dispatch_profiled)
 VG_(run_innerloop__dispatch_profiled):
-
 	/* AT ENTRY: r0 is next guest addr, r8 is possibly
         modified guest state ptr */
 
-        /* Has the guest state pointer been messed with?  If yes, exit. */
-        //movw r3, #:lower16:VG_(dispatch_ctr)
-	tst  r8, #1
+#if defined(ARM_ARCH_V6)
+		/* use slower code on pre-cortex architectures */
+        ldr r3, =VG_(dispatch_ctr)
+        tst  r8, #1
+#else
+        tst  r8, #1
+	ldr  r2,=VG_(dispatch_ctr)
 
-        //movt r3, #:upper16:VG_(dispatch_ctr)
+        bne  gsp_changed                // guest state pointer was modified
+	movs r3, r0, LSR #1             // shift off Thumb mode bit; set Carry
+#endif
 
-	bne  gsp_changed
+	ldr  r5,=VG_(tt_fast)
+	movcc  r3, r3, LSR #1           // if ARM mode then shift off another bit
 
-	/* save the jump address in the guest state */
-        str  r0, [r8, #OFFSET_arm_R15T]
+	ldr  r1, [r2]                   // dispatch_ctr
+	mov  r3, r3, LSL #CLR_HI        // shift off hi bits
 
-        /* Are we out of timeslice?  If yes, defer to scheduler. */
-        ldr  r2, [r3]
+        str  r0, [r8, #OFFSET_arm_R15T]  // save jump address into guest state
+	add  r5, r5, r3, LSR #CLR_LO -3 // r5= &tt_fast[entry#]
 
-        subs r2, r2, #1
+        ldr  r4, [r5, #0]               // r4= .guest
+        subs r1, r1, #1                 // decrement timeslice
 
-        str  r2, [r3]
+        ldr  r5, [r5, #4]               // r5= .host
+        beq  counter_is_zero            // out of timeslice ==> defer to scheduler
 
-        beq  counter_is_zero
+        cmp  r4, r0                     // check cache tag
+	ldr  r0, =VG_(tt_fastN)
 
-        /* try a fast lookup in the translation cache */
-        // r0 = next guest, r1,r2,r3,r4 scratch
-        //movw r1, #VG_TT_FAST_MASK       // r1 = VG_TT_FAST_MASK
-        //movw r4, #:lower16:VG_(tt_fast)
+#if defined(ARM_ARCH_V6)
+		/* use slower code on pre-cortex architectures */
+        ldr r1, =VG_TT_FAST_MASK       // r1 = VG_TT_FAST_MASK
+        ldr r4, =VG_(tt_fast)
+		and  r2, r1, r0, LSR #1         // r2 = entry #
+#else
+        streq  r1, [r2]                 // match: update dispatch_ctr
+	bne fast_lookup_failed
 
-	and  r2, r1, r0, LSR #1         // r2 = entry #
-        //movt r4, #:upper16:VG_(tt_fast) // r4 = &VG_(tt_fast)
-
-	add  r1, r4, r2, LSL #3         // r1 = &tt_fast[entry#]
-
-        ldrd r4, r5, [r1, #0]           // r4 = .guest, r5 = .host
-
-	cmp  r4, r0
-
-	bne  fast_lookup_failed
-        // r5: next-host    r8: live, gsp
-        // r4: next-guest
-        // r2: entry #
-        // LIVE: r5, r8; all others dead
-        
-        /* increment bb profile counter */
-        //movw r0, #:lower16:VG_(tt_fastN)
-        //movt r0, #:upper16:VG_(tt_fastN) // r0 = &tt_fastN[0]
-        ldr  r0, [r0, r2, LSL #2]        // r0 = tt_fast[entry #]
-        ldr  r3, [r0]                    // *r0 ++
-        add  r3, r3, #1
+	ldr  r0, [r0, r3, LSR #CLR_LO -2]  // tt_fastN[entry#]
+	adr  lr, VG_(run_innerloop__dispatch_profiled)  // &continuation
+// r0 stall
+	ldr  r3, [r0]
+// r3 stall
+	add  r3, r3, #1
+#endif	
+#if defined(ARM_ARCH_V6)
+		/* use slower code on pre-cortex architectures */
+        ldr r0, =VG_(tt_fastN)
+#else
         str  r3, [r0]
-
-        /* Found a match.  Jump to .host. */
-	blx  r5
-	b    VG_(run_innerloop__dispatch_profiled)
+	bx  r5                         // match: jump to .host, continue at *lr
+#endif
+           
 	/*NOTREACHED*/
 
 /*----------------------------------------------------*/
@@ -211,49 +271,6 @@ gsp_changed:
 	mov r0, r8      // "return modified gsp"
 	b run_innerloop_exit
         /*NOTREACHED*/
-
-counter_is_zero:
-        /* R15T is up to date here */
-        /* Back out increment of the dispatch ctr */
-        ldr  r1, =VG_(dispatch_ctr)
-        ldr  r2, [r1]
-        add  r2, r2, #1
-        str  r2, [r1]
-        mov  r0, #VG_TRC_INNER_COUNTERZERO
-        b    run_innerloop_exit
-        /*NOTREACHED*/
-        
-fast_lookup_failed:
-        /* R15T is up to date here */
-        /* Back out increment of the dispatch ctr */
-        ldr  r1, =VG_(dispatch_ctr)
-        ldr  r2, [r1]
-        add  r2, r2, #1
-        str  r2, [r1]
-	mov  r0, #VG_TRC_INNER_FASTMISS
-	b    run_innerloop_exit
-        /*NOTREACHED*/
-
-/* All exits from the dispatcher go through here.  %r0 holds
-   the return value. 
-*/
-run_innerloop_exit:
-        /* We're leaving.  Check that nobody messed with
-           FPSCR in ways we don't expect. */
-        fmrx r4, fpscr
-        bic  r4, #0xF8000000 /* mask out NZCV and QC */
-        bic  r4, #0x0000009F /* mask out IDC,IXC,UFC,OFC,DZC,IOC */
-        cmp  r4, #0
-        bne  invariant_violation
-        b    run_innerloop_exit_REALLY
-
-invariant_violation:
-        mov  r0, #VG_TRC_INVARIANT_FAILED
-        b    run_innerloop_exit_REALLY
-
-run_innerloop_exit_REALLY:
-	add sp, sp, #8
-	pop {r4, r5, r6, r7, r8, r9, fp, pc}
 
 .size VG_(run_innerloop), .-VG_(run_innerloop)
 
